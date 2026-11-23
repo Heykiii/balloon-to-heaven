@@ -1,14 +1,11 @@
 name: Test, build and publish
 
-# Builds the game with Unity through GameCI:
-#   * EditMode tests
-#   * WebGL build deployed to GitHub Pages (play in the browser)
-#   * Android APK attached to a GitHub Release (download and install)
+# Godot 4 build. No secrets or accounts are needed.
+#   * tests: logic tests, every script compiles, headless smoke test that plays levels
+#   * web: HTML5 export deployed to GitHub Pages (play in the browser)
+#   * android: APK attached to a GitHub Release (download and install)
 #
-# Required repository secrets (Settings > Secrets and variables > Actions):
-#   UNITY_LICENSE   full contents of your Unity_lic.ulf file
-#   UNITY_EMAIL     Unity account email
-#   UNITY_PASSWORD  Unity account password
+# One-time setup: Settings > Pages > Build and deployment > Source: "GitHub Actions".
 
 on:
   push:
@@ -20,83 +17,61 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
-  UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
-  UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+  GODOT_VERSION: 4.5.1
+  GODOT_URL: https://github.com/godotengine/godot-builds/releases/download/4.5.1-stable
 
 jobs:
-  check:
-    name: Check Unity license secrets
-    runs-on: ubuntu-latest
-    outputs:
-      ok: ${{ steps.check.outputs.ok }}
-    steps:
-      - id: check
-        run: |
-          if [ -z "$UNITY_LICENSE" ] || [ -z "$UNITY_EMAIL" ] || [ -z "$UNITY_PASSWORD" ]; then
-            echo "::warning title=Unity license missing::Add UNITY_LICENSE, UNITY_EMAIL and UNITY_PASSWORD under Settings > Secrets and variables > Actions, then re-run this workflow."
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "ok=true" >> "$GITHUB_OUTPUT"
-          fi
-
   tests:
-    name: EditMode tests
-    needs: check
-    if: needs.check.outputs.ok == 'true'
+    name: Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: true
-      - uses: actions/cache@v4
-        with:
-          path: Library
-          key: Library-test-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
-          restore-keys: Library-test-
-      - uses: game-ci/unity-test-runner@v4
-        id: tests
-        with:
-          testMode: editmode
-          githubToken: ${{ secrets.GITHUB_TOKEN }}
-          checkName: EditMode test results
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: test-results
-          path: ${{ steps.tests.outputs.artifactsPath }}
+      - name: Install Godot
+        run: |
+          wget -q "$GODOT_URL/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip" -O godot.zip
+          unzip -q godot.zip && sudo mv Godot_v${GODOT_VERSION}-stable_linux.x86_64 /usr/local/bin/godot
+          godot --version
+      - name: Import project
+        run: godot --headless --path . --import || true
+      - name: Logic tests
+        run: godot --headless --path . -s res://tests/run_tests.gd
+      - name: Every script compiles
+        run: godot --headless --path . -s res://tests/check_scripts.gd
+      - name: Smoke test (autopilot plays levels and bosses)
+        run: |
+          godot --headless --path . --fixed-fps 60 -s res://tests/smoke_test.gd 2>&1 | tee smoke.log
+          if grep -q "SCRIPT ERROR" smoke.log; then echo "::error::Script errors during the smoke test"; exit 1; fi
+          grep -q "SMOKE TEST PASSED" smoke.log
 
-  webgl:
-    name: Build WebGL
-    needs: [ check, tests ]
-    # Build even if a test fails, so there is always something to play.
-    if: ${{ !cancelled() && needs.check.outputs.ok == 'true' }}
+  web:
+    name: Web export
+    needs: tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: true
-      - uses: actions/cache@v4
-        with:
-          path: Library
-          key: Library-WebGL-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
-          restore-keys: Library-WebGL-
-      - uses: game-ci/unity-builder@v4
-        with:
-          targetPlatform: WebGL
-          buildName: WebGL
-          buildsPath: build
-          buildMethod: BalloonToHeaven.EditorTools.BuildScript.BuildWebGL
-      - name: Add a no-Jekyll marker for Pages
-        run: sudo touch build/WebGL/WebGL/.nojekyll && ls -la build/WebGL/WebGL
+      - name: Install Godot and export templates
+        run: |
+          wget -q "$GODOT_URL/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip" -O godot.zip
+          unzip -q godot.zip && sudo mv Godot_v${GODOT_VERSION}-stable_linux.x86_64 /usr/local/bin/godot
+          wget -q "$GODOT_URL/Godot_v${GODOT_VERSION}-stable_export_templates.tpz" -O templates.tpz
+          mkdir -p ~/.local/share/godot/export_templates/${GODOT_VERSION}.stable
+          unzip -q templates.tpz -d tpl && mv tpl/templates/* ~/.local/share/godot/export_templates/${GODOT_VERSION}.stable/
+      - name: Export
+        run: |
+          godot --headless --path . --import || true
+          mkdir -p build/web
+          godot --headless --path . --export-release "Web" build/web/index.html
+          ls -la build/web
+          test -f build/web/index.pck
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: build/WebGL/WebGL
+          path: build/web
 
-  deploy-pages:
+  deploy:
     name: Deploy to GitHub Pages
-    needs: webgl
-    if: ${{ !cancelled() && needs.webgl.result == 'success' }}
+    needs: web
     runs-on: ubuntu-latest
     permissions:
       pages: write
@@ -109,58 +84,76 @@ jobs:
         uses: actions/deploy-pages@v4
 
   android:
-    name: Build Android APK
-    needs: [ check, tests ]
-    if: ${{ !cancelled() && needs.check.outputs.ok == 'true' }}
+    name: Android APK
+    needs: tests
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     permissions:
       contents: write
     steps:
-      - name: Free disk space (Android builds are large)
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          android: false
-          dotnet: true
-          haskell: true
-          large-packages: false
-          docker-images: false
-          swap-storage: false
       - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
-          lfs: true
-      - uses: actions/cache@v4
-        with:
-          path: Library
-          key: Library-Android-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
-          restore-keys: Library-Android-
-      - uses: game-ci/unity-builder@v4
-        env:
-          ANDROID_VERSION_CODE: ${{ github.run_number }}
-        with:
-          targetPlatform: Android
-          androidExportType: androidPackage
-          buildName: BalloonToHeaven
-          buildsPath: build
-          buildMethod: BalloonToHeaven.EditorTools.BuildScript.BuildAndroid
-      - name: Locate APK
-        id: apk
+          distribution: temurin
+          java-version: '17'
+      - name: Install Godot and export templates
         run: |
-          APK=$(find build -name "*.apk" | head -n 1)
-          if [ -z "$APK" ]; then echo "No APK produced"; exit 1; fi
-          sudo cp "$APK" BalloonToHeaven.apk
-          echo "path=BalloonToHeaven.apk" >> "$GITHUB_OUTPUT"
+          wget -q "$GODOT_URL/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip" -O godot.zip
+          unzip -q godot.zip && sudo mv Godot_v${GODOT_VERSION}-stable_linux.x86_64 /usr/local/bin/godot
+          wget -q "$GODOT_URL/Godot_v${GODOT_VERSION}-stable_export_templates.tpz" -O templates.tpz
+          mkdir -p ~/.local/share/godot/export_templates/${GODOT_VERSION}.stable
+          unzip -q templates.tpz -d tpl && mv tpl/templates/* ~/.local/share/godot/export_templates/${GODOT_VERSION}.stable/
+      # The signing key is a throwaway key made here, not a secret. It is cached so later
+      # builds keep the same signature and install over the previous version.
+      - name: Restore signing key
+        id: key
+        uses: actions/cache@v4
+        with:
+          path: ~/apk-key/release.keystore
+          key: apk-signing-key-v1
+      - name: Create signing key
+        if: steps.key.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/apk-key
+          keytool -genkeypair -v -keystore ~/apk-key/release.keystore -alias balloon -keyalg RSA -keysize 2048 \
+            -validity 10000 -storepass balloon -keypass balloon -dname "CN=Balloon to Heaven, O=Balloon to Heaven, C=US"
+      - name: Configure Android export
+        run: |
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          echo "Android SDK: $SDK"; ls "$SDK/build-tools"
+          mkdir -p ~/.config/godot
+          cat > ~/.config/godot/editor_settings-4.5.tres <<EOT
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "$SDK"
+          export/android/java_sdk_path = "$JAVA_HOME"
+          EOT
+          sed -i 's/^ *//' ~/.config/godot/editor_settings-4.5.tres
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_PATH=$HOME/apk-key/release.keystore" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_USER=balloon" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD=balloon" >> "$GITHUB_ENV"
+          # version code grows with every build so phones accept the update
+          sed -i "s/^version\/code=.*/version\/code=${GITHUB_RUN_NUMBER}/" export_presets.cfg
+      - name: Export APK
+        run: |
+          godot --headless --path . --import || true
+          mkdir -p build/android
+          godot --headless --path . --export-release "Android" build/android/BalloonToHeaven.apk
+          ls -la build/android
+          test -f build/android/BalloonToHeaven.apk
       - uses: actions/upload-artifact@v4
         with:
           name: BalloonToHeaven-apk
-          path: BalloonToHeaven.apk
+          path: build/android/BalloonToHeaven.apk
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
           name: Balloon to Heaven (build ${{ github.run_number }})
+          make_latest: true
           body: |
             Android APK built from ${{ github.sha }}.
-            Install: download BalloonToHeaven.apk on your phone, open it, and allow installs from this source.
+            Download BalloonToHeaven.apk on your phone and open it (allow "install unknown apps" if asked).
             Play in the browser: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
-          files: BalloonToHeaven.apk
-          make_latest: true
+          files: build/android/BalloonToHeaven.apk
